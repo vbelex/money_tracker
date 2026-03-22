@@ -26,14 +26,13 @@ options(scipen = 999)  # bias against scientific notation
 # ───────────────────────────────────────────────────────────────
 pool <- pool::dbPool(
   drv      = odbc::odbc(),
-  Driver   = "ODBC Driver 18 for SQL Server",
-  Server   = "tcp:money-tracker.database.windows.net,1433",
-  Database = "free-sql-db-1438244",
-  UID      = "vbelex",
+  Driver   = "SQLServer",
+  Server   = Sys.getenv("SERVER"),
+  Database = Sys.getenv("DATABASE"),
+  UID      = Sys.getenv("AZURE_SQL_UID"),
   PWD      = Sys.getenv("AZURE_SQL_PWD"),  # set in .Renviron or hosting secret
   Encrypt  = "yes",
   TrustServerCertificate = "no",
-  schema = Sys.getenv("SCHEMA_NAME"),
   Timeout  = 30
 )
 
