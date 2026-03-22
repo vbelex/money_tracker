@@ -72,23 +72,40 @@ new_id <- function() {
 # Month key from Date
 to_month_key <- function(date) format(as.Date(date), "%Y-%m")
 
-# Safe write: read old, bind new, write tmp, rename
+# Align columns so bind_rows never fails due to missing columns
+align_columns <- function(df, cols) {
+  for (c in cols) if (!c %in% names(df)) df[[c]] <- NA
+  df[, cols]
+}
+
 append_rows_and_save <- function(new_rows, path) {
-  # Identify which amount column exists
-  amt_col <- intersect(names(new_rows), c("income_amount", "expense_amount"))
-  if (length(amt_col) == 1) {
-    # Coerce the new rows' amount to numeric
-    new_rows[[amt_col]] <- suppressWarnings(as.numeric(new_rows[[amt_col]]))
+  # Define columns that must be character in CSV
+  char_cols <- c("id","user_id","date","month","source","category","description","created_at","type")
+  # Define amount columns that must be numeric
+  num_cols  <- c("income_amount","expense_amount","income_total","expense_total","balance","credit","debit")
+  
+  # Coerce new rows
+  for (c in intersect(names(new_rows), char_cols)) {
+    new_rows[[c]] <- as.character(new_rows[[c]])
+  }
+  for (c in intersect(names(new_rows), num_cols)) {
+    new_rows[[c]] <- suppressWarnings(as.numeric(new_rows[[c]]))
   }
   
   if (file.exists(path) && file.size(path) > 0) {
     old <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
-    
-    # If the old file has the same amount column, coerce it too
-    if (length(amt_col) == 1 && amt_col %in% names(old)) {
-      old[[amt_col]] <- suppressWarnings(as.numeric(old[[amt_col]]))
+    # Coerce old to the same types
+    for (c in intersect(names(old), char_cols)) {
+      old[[c]] <- as.character(old[[c]])
+    }
+    for (c in intersect(names(old), num_cols)) {
+      old[[c]] <- suppressWarnings(as.numeric(old[[c]]))
     }
     
+    # Align and bind
+    all_cols <- union(names(old), names(new_rows))
+    old <- align_columns(old, all_cols)
+    new_rows <- align_columns(new_rows, all_cols)
     out <- dplyr::bind_rows(old, new_rows)
   } else {
     out <- new_rows
@@ -204,7 +221,7 @@ ui <- navbarPage(
           dateInput("expense_date", "Expense date", value = Sys.Date(), format = "yyyy-mm-dd"),
           selectInput(
             "expense_category", "Category",
-            choices = c("Groceries", "Rent", "Utilities", "Transport", "Dining", "Health", "Education", "Shopping", "Entertainment", "Other"),
+            choices = c("Groceries", "Rent", "Utilities", "Transport", "Dining", "Health", "Education", "Shopping", "Entertainment", "EMI", "Credit Card Bill", "Other"),
             selected = "Groceries"
           ),
           textInput("expense_desc", "Description (optional)", placeholder = "Note or merchant"),
