@@ -1,6 +1,7 @@
 # app.R
 # Personal Finance Tracker (Income, Expenses, Monthly Balance)
 # Multi-user by typed username (created on first use)
+# Azure SQL (ODBC) backend
 # Vaibhav Sunil Borkar – Shiny App
 
 # ───────────────────────────────────────────────────────────────
@@ -8,193 +9,217 @@
 # ───────────────────────────────────────────────────────────────
 library(shiny)
 library(shinythemes)
-library(readr)
+library(DBI)
+library(odbc)
+library(pool)
 library(dplyr)
 library(stringr)
 library(lubridate)
 library(DT)
 library(tidyr)
 library(ggplot2)
+library(readr)    # only for write_csv in downloads (no reading from CSV files)
+options(scipen = 999)  # bias against scientific notation
 
 # ───────────────────────────────────────────────────────────────
-# Config & helpers
+# DB Connection Pool (Azure SQL via ODBC Driver 18)
 # ───────────────────────────────────────────────────────────────
-DATA_DIR    <- "data"
-USERS_CSV   <- file.path(DATA_DIR, "users.csv")
-INCOME_CSV  <- file.path(DATA_DIR, "incomes.csv")
-EXPENSE_CSV <- file.path(DATA_DIR, "expenses.csv")
-BALANCE_CSV <- file.path(DATA_DIR, "balances.csv")
-options(scipen = 999)  # larger value → less scientific notation
+pool <- pool::dbPool(
+  drv      = odbc::odbc(),
+  Driver   = "ODBC Driver 18 for SQL Server",
+  Server   = "tcp:money-tracker.database.windows.net,1433",
+  Database = "free-sql-db-1438244",
+  UID      = "vbelex",
+  PWD      = Sys.getenv("AZURE_SQL_PWD"),  # set in .Renviron or hosting secret
+  Encrypt  = "yes",
+  TrustServerCertificate = "no",
+  schema = Sys.getenv("SCHEMA_NAME"),
+  Timeout  = 30
+)
 
-ensure_data_files <- function() {
-  if (!dir.exists(DATA_DIR)) dir.create(DATA_DIR, recursive = TRUE)
-  
-  if (!file.exists(USERS_CSV)) {
-    write_csv(
-      tibble(
-        username   = character(),
-        created_at = character()
-      ),
-      USERS_CSV
-    )
-  }
-  
-  if (!file.exists(INCOME_CSV)) {
-    write_csv(
-      tibble(
-        id            = character(),
-        username      = character(),
-        month         = character(),     # YYYY-MM
-        income_amount = double(),
-        source        = character(),
-        created_at    = character()
-      ),
-      INCOME_CSV
-    )
-  }
-  
-  if (!file.exists(EXPENSE_CSV)) {
-    write_csv(
-      tibble(
-        id             = character(),
-        username       = character(),
-        date           = character(),    # YYYY-MM-DD
-        month          = character(),    # YYYY-MM
-        category       = character(),
-        description    = character(),
-        expense_amount = double(),
-        created_at     = character()
-      ),
-      EXPENSE_CSV
-    )
-  }
-  
-  if (!file.exists(BALANCE_CSV)) {
-    write_csv(
-      tibble(
-        username     = character(),
-        month        = character(),      # YYYY-MM
-        income_total = double(),
-        expense_total= double(),
-        balance      = double()
-      ),
-      BALANCE_CSV
-    )
-  }
+onStop(function() {
+  pool::poolClose(pool)
+})
+
+# Helper: NULL-coalescing
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ───────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────
+
+DB_SCHEMA <- Sys.getenv("SCHEMA_NAME")
+
+# Quote [schema].[table] safely for SQL Server via DBI
+qt <- function(tbl) {
+  DBI::dbQuoteIdentifier(pool, DBI::Id(schema = DB_SCHEMA, table = tbl)) |> as.character()
 }
 
-# Safe, simple ID
+# tiny paste helper used below
+`%+%` <- function(a,b) paste0(a,b)
+
+
 new_id <- function() paste0(format(Sys.time(), "%Y%m%d%H%M%S"), "-", sample(1000:9999, 1))
-
-# Month key from Date
 to_month_key <- function(date) format(as.Date(date), "%Y-%m")
-
-# Align columns helper for robust bind_rows
-align_columns <- function(df, cols) {
-  for (c in cols) if (!c %in% names(df)) df[[c]] <- NA
-  df[, cols]
-}
-
-# Type-safe appender: enforce character/numeric columns before binding
-append_rows_and_save <- function(new_rows, path) {
-  # Columns that should be character in CSVs
-  char_cols <- c("id","username","date","month","source","category","description","created_at","type")
-  # Columns that should be numeric
-  num_cols  <- c("income_amount","expense_amount","income_total","expense_total","balance","credit","debit")
-  
-  # Coerce NEW rows
-  for (c in intersect(names(new_rows), char_cols)) new_rows[[c]] <- as.character(new_rows[[c]])
-  for (c in intersect(names(new_rows), num_cols))  new_rows[[c]] <- suppressWarnings(as.numeric(new_rows[[c]]))
-  
-  if (file.exists(path) && file.size(path) > 0) {
-    old <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
-    
-    # Coerce OLD rows
-    for (c in intersect(names(old), char_cols)) old[[c]] <- as.character(old[[c]])
-    for (c in intersect(names(old), num_cols))  old[[c]] <- suppressWarnings(as.numeric(old[[c]]))
-    
-    # Align & bind
-    all_cols <- union(names(old), names(new_rows))
-    old <- align_columns(old, all_cols)
-    new_rows <- align_columns(new_rows, all_cols)
-    out <- dplyr::bind_rows(old, new_rows)
-  } else {
-    out <- new_rows
-  }
-  
-  tmp <- paste0(path, ".tmp")
-  readr::write_csv(out, tmp)
-  file.rename(tmp, path)
-}
-
-# Readers with backfill for legacy files (no username) + type coercion
-read_users <- function(path = USERS_CSV) {
-  if (!file.exists(path) || file.size(path) == 0) return(tibble())
-  suppressMessages(readr::read_csv(path, show_col_types = FALSE)) %>%
-    mutate(username = as.character(username),
-           created_at = as.character(created_at))
-}
-
-read_incomes <- function(path = INCOME_CSV) {
-  if (!file.exists(path) || file.size(path) == 0) return(tibble())
-  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
-  if (!"username" %in% names(df)) df$username <- "legacy"
-  df %>%
-    mutate(
-      id            = as.character(id),
-      username      = as.character(username),
-      month         = as.character(month),
-      source        = as.character(source),
-      created_at    = as.character(created_at),
-      income_amount = suppressWarnings(as.numeric(income_amount))
-    )
-}
-
-read_expenses <- function(path = EXPENSE_CSV) {
-  if (!file.exists(path) || file.size(path) == 0) return(tibble())
-  df <- suppressMessages(readr::read_csv(path, show_col_types = FALSE))
-  if (!"username" %in% names(df)) df$username <- "legacy"
-  df %>%
-    mutate(
-      id             = as.character(id),
-      username       = as.character(username),
-      date           = as.character(date),
-      month          = as.character(month),
-      category       = as.character(category),
-      description    = as.character(description),
-      created_at     = as.character(created_at),
-      expense_amount = suppressWarnings(as.numeric(expense_amount))
-    )
-}
-
-# Recompute balances.csv from incomes & expenses grouped by username + month
-recompute_balances <- function() {
-  inc <- read_incomes()
-  exp <- read_expenses()
-  
-  inc_summarised <- inc %>%
-    mutate(month = as.character(month), username = as.character(username)) %>%
-    group_by(username, month) %>%
-    summarise(income_total = sum(income_amount, na.rm = TRUE), .groups = "drop")
-  
-  exp_summarised <- exp %>%
-    mutate(month = as.character(month), username = as.character(username)) %>%
-    group_by(username, month) %>%
-    summarise(expense_total = sum(expense_amount, na.rm = TRUE), .groups = "drop")
-  
-  bal <- full_join(inc_summarised, exp_summarised, by = c("username","month")) %>%
-    replace_na(list(income_total = 0, expense_total = 0)) %>%
-    mutate(balance = income_total - expense_total) %>%
-    arrange(username, month)
-  
-  tmp <- paste0(BALANCE_CSV, ".tmp")
-  write_csv(bal, tmp)
-  file.rename(tmp, BALANCE_CSV)
-}
-
-# Format currency
 fmt_cur <- function(x, currency = "₹") {
-  paste0(currency, format(round(x, 2), big.mark = ",", nsmall = 2, trim = TRUE))
+  x <- suppressWarnings(as.numeric(x))
+  paste0(currency, format(round(x, 2), big.mark = ",", nsmall = 2, trim = TRUE, scientific = FALSE))
+}
+
+# CRUD – Users
+# User existence
+db_user_exists <- function(username) {
+  u_tbl <- qt("users")
+  n <- DBI::dbGetQuery(pool,
+                       sprintf("SELECT COUNT(*) AS n FROM %s WHERE LOWER(username) = LOWER(?)", u_tbl),
+                       params = list(username)
+  )$n
+  as.integer(n) > 0
+}
+
+# Create user
+db_create_user <- function(username) {
+  u_tbl <- qt("users")
+  DBI::dbExecute(pool,
+                 sprintf("INSERT INTO %s (username, created_at) VALUES (?, SYSUTCDATETIME())", u_tbl),
+                 params = list(username)
+  )
+}
+
+# Insert income
+db_insert_income <- function(id, username, month, amount, source) {
+  i_tbl <- qt("incomes")
+  DBI::dbExecute(pool,
+                 sprintf("INSERT INTO %s (id, username, month, income_amount, source, created_at)
+             VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME())", i_tbl),
+                 params = list(id, username, month, as.numeric(amount), source)
+  )
+}
+
+# Insert expense
+db_insert_expense <- function(id, username, date, month, category, description, amount) {
+  e_tbl <- qt("expenses")
+  DBI::dbExecute(pool,
+                 sprintf("INSERT INTO %s (id, username, [date], month, category, description, expense_amount, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())", e_tbl),
+                 params = list(id, username, as.Date(date), month, category, description, as.numeric(amount))
+  )
+}
+
+# Distinct months for a user
+db_user_months <- function(username) {
+  i_tbl <- qt("incomes"); e_tbl <- qt("expenses")
+  DBI::dbGetQuery(pool, sprintf("
+    WITH m AS (
+      SELECT month FROM %s WHERE username = ?
+      UNION
+      SELECT month FROM %s WHERE username = ?
+    )
+    SELECT DISTINCT month FROM m ORDER BY month
+  ", i_tbl, e_tbl), params = list(username, username))$month
+}
+
+# Read incomes
+db_read_incomes <- function(username = NULL, month = NULL) {
+  i_tbl <- qt("incomes")
+  if (is.null(username) && is.null(month)) {
+    return(DBI::dbGetQuery(pool, sprintf("SELECT id, username, month, income_amount, source, created_at FROM %s", i_tbl)))
+  }
+  if (!is.null(username) && is.null(month)) {
+    return(DBI::dbGetQuery(pool, sprintf("
+      SELECT id, username, month, income_amount, source, created_at
+        FROM %s WHERE username = ? ORDER BY created_at DESC", i_tbl), params = list(username)))
+  }
+  if (!is.null(username) && !is.null(month)) {
+    return(DBI::dbGetQuery(pool, sprintf("
+      SELECT id, username, month, income_amount, source, created_at
+        FROM %s WHERE username = ? AND month = ? ORDER BY created_at DESC", i_tbl), params = list(username, month)))
+  }
+  if (is.null(username) && !is.null(month)) {
+    return(DBI::dbGetQuery(pool, sprintf("
+      SELECT id, username, month, income_amount, source, created_at
+        FROM %s WHERE month = ?", i_tbl), params = list(month)))
+  }
+}
+
+# Read expenses
+db_read_expenses <- function(username = NULL, month = NULL) {
+  e_tbl <- qt("expenses")
+  base <- sprintf("
+    SELECT id, username, CONVERT(VARCHAR(10), [date], 23) AS date,
+           month, category, description, expense_amount, created_at
+      FROM %s", e_tbl)
+  if (is.null(username) && is.null(month)) return(DBI::dbGetQuery(pool, base))
+  if (!is.null(username) && is.null(month))
+    return(DBI::dbGetQuery(pool, paste(base, "WHERE username = ? ORDER BY [date] DESC, created_at DESC"),
+                           params = list(username)))
+  if (!is.null(username) && !is.null(month))
+    return(DBI::dbGetQuery(pool, paste(base, "WHERE username = ? AND month = ? ORDER BY [date] DESC, created_at DESC"),
+                           params = list(username, month)))
+  if (is.null(username) && !is.null(month))
+    return(DBI::dbGetQuery(pool, paste(base, "WHERE month = ?"),
+                           params = list(month)))
+}
+
+# Balances (computed on the fly)
+db_balances <- function(usernames = NULL, months = NULL) {
+  i_tbl <- qt("incomes"); e_tbl <- qt("expenses")
+  sql <- sprintf("
+    WITH inc AS (
+      SELECT username, month, SUM(income_amount) AS income_total
+        FROM %s GROUP BY username, month
+    ),
+    exp AS (
+      SELECT username, month, SUM(expense_amount) AS expense_total
+        FROM %s GROUP BY username, month
+    )
+    SELECT COALESCE(inc.username, exp.username) AS username,
+           COALESCE(inc.month,    exp.month)    AS month,
+           COALESCE(inc.income_total, 0)        AS income_total,
+           COALESCE(exp.expense_total, 0)       AS expense_total,
+           COALESCE(inc.income_total, 0) - COALESCE(exp.expense_total, 0) AS balance
+      FROM inc
+ FULL OUTER JOIN exp
+        ON inc.username = exp.username AND inc.month = exp.month
+    WHERE 1 = 1
+  ", i_tbl, e_tbl)
+  
+  params <- list()
+  if (!is.null(usernames) && length(usernames) > 0) {
+    sql <- paste0(sql, " AND COALESCE(inc.username, exp.username) IN (", paste(rep("?", length(usernames)), collapse=","), ")")
+    params <- c(params, as.list(usernames))
+  }
+  if (!is.null(months) && length(months) > 0) {
+    sql <- paste0(sql, " AND COALESCE(inc.month, exp.month) IN (", paste(rep("?", length(months)), collapse=","), ")")
+    params <- c(params, as.list(months))
+  }
+  sql <- paste0(sql, " ORDER BY username, month")
+  DBI::dbGetQuery(pool, sql, params = params)
+}
+
+db_all_usernames <- function() {
+  u_tbl <- qt("users")
+  # Distinct usernames from users table (registry)
+  users <- tryCatch(
+    DBI::dbGetQuery(pool, sprintf("SELECT username FROM %s", u_tbl)),
+    error = function(e) data.frame(username = character())
+  )
+  
+  # Also union usernames that may exist only in data (defensive)
+  i_tbl <- qt("incomes")
+  e_tbl <- qt("expenses")
+  
+  inc_users <- tryCatch(
+    DBI::dbGetQuery(pool, sprintf("SELECT DISTINCT username FROM %s", i_tbl)),
+    error = function(e) data.frame(username = character())
+  )
+  exp_users <- tryCatch(
+    DBI::dbGetQuery(pool, sprintf("SELECT DISTINCT username FROM %s", e_tbl)),
+    error = function(e) data.frame(username = character())
+  )
+  
+  # Combine and sort
+  sort(unique(c(users$username, inc_users$username, exp_users$username)))
 }
 
 # ───────────────────────────────────────────────────────────────
@@ -244,7 +269,6 @@ ui <- navbarPage(
     sidebarLayout(
       sidebarPanel(
         width = 3,
-        # Signed-in banner and switch user
         div(
           strong("Signed in as:"),
           textOutput("whoami", inline = TRUE),
@@ -341,12 +365,10 @@ ui <- navbarPage(
 # ───────────────────────────────────────────────────────────────
 server <- function(input, output, session) {
   
-  ensure_data_files()
-  
   # Current signed-in username (filled by modal at startup)
   current_user <- reactiveVal(NULL)
   
-  # Open sign-in modal
+  # Sign-in modal
   open_signin_modal <- function(preset = "") {
     showModal(modalDialog(
       title = "Sign in",
@@ -362,71 +384,116 @@ server <- function(input, output, session) {
       easyClose = FALSE
     ))
   }
-  
-  # Show modal on app start
   open_signin_modal()
   
-  # Select users available in registry (or with data)
+  # Username hint (availability)
+  output$username_hint <- renderUI({
+    u <- trimws(input$username_input %||% "")
+    if (!nzchar(u)) return(NULL)
+    exists <- FALSE
+    if (nzchar(u)) exists <- db_user_exists(u)
+    if (exists) {
+      span(style="color:#16a085;", "✅ Existing user; your data will be loaded.")
+    } else {
+      span(style="color:#2980b9;", "ℹ️ New user; your profile will be created.")
+    }
+  })
+  
+  # Handle sign-in
+  observeEvent(input$btn_signin, {
+    u <- trimws(input$username_input %||% "")
+    validate(need(nzchar(u), "Please enter a username."))
+    if (!db_user_exists(u)) db_create_user(u)
+    current_user(u)
+    removeModal()
+  })
+  
+  # Switch user later
+  observeEvent(input$switch_user, {
+    open_signin_modal(preset = current_user() %||% "")
+  })
+  
+  # Banner
+  output$whoami <- renderText({
+    cu <- current_user()
+    if (is.null(cu)) "—" else cu
+  })
+  
+  # ------------- Combined Dashboard selectors ------------------
+  
   output$combo_user_selector <- renderUI({
-    # If you are using read_users(); else build from incomes/expenses
-    users <- tryCatch(read_users(), error = function(e) tibble())
-    # Fall back to usernames in data if users.csv is empty
-    inc <- tryCatch(incomes_react(), error = function(e) tibble())
-    exp <- tryCatch(expenses_react(), error = function(e) tibble())
-    data_users <- unique(c(inc$username %||% character(), exp$username %||% character()))
-    choices <- sort(unique(c(users$username %||% character(), data_users)))
+    users <- db_all_usernames()
     selectizeInput(
       "combo_users",
       "Users",
-      choices = choices,
+      choices = sort(users),
       multiple = TRUE,
       options = list(placeholder = "Choose one or more users")
     )
   })
   
-  # Select months available for selected users
   output$combo_month_selector <- renderUI({
     req(length(input$combo_users) > 0)
-    inc <- tryCatch(incomes_react(), error = function(e) tibble())
-    exp <- tryCatch(expenses_react(), error = function(e) tibble())
-    months <- c(
-      inc$month[inc$username %in% input$combo_users],
-      exp$month[exp$username %in% input$combo_users]
-    ) %>% unique() %>% sort()
+    
+    # Schema-qualified tables
+    i_tbl <- qt("incomes")
+    e_tbl <- qt("expenses")
+    
+    # IN list placeholders matching number of selected users
+    placeholders <- paste(rep("?", length(input$combo_users)), collapse = ",")
+    
+    # Build the SQL string with schema-qualified tables and placeholders
+    sql <- sprintf("
+    WITH m AS (
+      SELECT username, month FROM %s
+      UNION ALL
+      SELECT username, month FROM %s
+    )
+    SELECT DISTINCT month
+    FROM m
+    WHERE username IN (%s)
+    ORDER BY month
+  ", i_tbl, e_tbl, placeholders)
+    
+    months <- DBI::dbGetQuery(
+      pool,
+      sql,
+      params = as.list(input$combo_users)
+    )$month
+    
     if (length(months) == 0) months <- to_month_key(Sys.Date())
+    
     selectizeInput(
       "combo_months",
       "Months (YYYY-MM)",
-      choices = months,
-      selected = tail(months, min(6, length(months))),  # preselect last few
-      multiple = TRUE
+      choices   = months,
+      selected  = tail(months, min(6, length(months))),
+      multiple  = TRUE
     )
   })
   
-  # Helper to slice balances for selected users & months
+
+  
+  # Helper to paste with no spaces
+  "%+%" <- function(a,b) paste0(a,b)
+  
+  # ---------- Combined Dashboard cards/plot/tables --------------
   combo_balances_selected <- reactive({
     req(length(input$combo_users) > 0, length(input$combo_months) > 0)
-    bal <- tryCatch(balances_react(), error = function(e) tibble())
-    if (!"username" %in% names(bal)) return(tibble())  # in case legacy
-    bal %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+    db_balances(usernames = input$combo_users, months = input$combo_months)
   })
   
   output$combo_card_income <- renderText({
     bal <- combo_balances_selected()
-    val <- sum(bal$income_total %||% 0, na.rm = TRUE)
-    fmt_cur(val)
+    fmt_cur(sum(bal$income_total %||% 0, na.rm = TRUE))
   })
-  
   output$combo_card_expense <- renderText({
     bal <- combo_balances_selected()
-    val <- sum(bal$expense_total %||% 0, na.rm = TRUE)
-    fmt_cur(val)
+    fmt_cur(sum(bal$expense_total %||% 0, na.rm = TRUE))
   })
-  
   output$combo_card_balance <- renderText({
     bal <- combo_balances_selected()
-    val <- sum((bal$income_total %||% 0) - (bal$expense_total %||% 0), na.rm = TRUE)
-    fmt_cur(val)
+    fmt_cur(sum(bal$income_total - bal$expense_total, na.rm = TRUE))
   })
   
   output$combo_plot_trend <- renderPlot({
@@ -435,12 +502,12 @@ server <- function(input, output, session) {
     bal2 <- bal %>%
       group_by(month) %>%
       summarise(
-        income_total = sum(income_total, na.rm = TRUE),
+        income_total  = sum(income_total,  na.rm = TRUE),
         expense_total = sum(expense_total, na.rm = TRUE),
-        balance = income_total - expense_total,
+        balance       = income_total - expense_total,
         .groups = "drop"
       ) %>%
-      mutate(month_date = lubridate::ymd(paste0(month, "-01"))) %>%
+      mutate(month_date = ymd(paste0(month, "-01"))) %>%
       arrange(month_date)
     
     ggplot(bal2, aes(x = month_date)) +
@@ -450,7 +517,6 @@ server <- function(input, output, session) {
       geom_point(aes(y = balance, color = "Balance"), size = 2) +
       scale_fill_manual(values = c("Income" = "#2ecc71", "Expenses" = "#e74c3c")) +
       scale_color_manual(values = c("Balance" = "#3498db")) +
-      # non-scientific labels with ₹
       scale_y_continuous(labels = scales::label_comma(accuracy = 1, prefix = "₹")) +
       labs(x = "Month", y = "Amount", fill = "", color = "", title = "Combined Income / Expenses / Balance") +
       theme_minimal()
@@ -466,7 +532,8 @@ server <- function(input, output, session) {
         expense_total = sum(expense_total, na.rm = TRUE),
         balance       = income_total - expense_total,
         .groups = "drop"
-      ) %>% arrange(desc(balance))
+      ) %>%
+      arrange(desc(balance))
     
     dt <- datatable(by_user, rownames = FALSE, options = list(pageLength = 10, autoWidth = TRUE))
     dt <- DT::formatCurrency(dt, "income_total",  currency = "₹", interval = 3, mark = ",", digits = 2)
@@ -477,10 +544,9 @@ server <- function(input, output, session) {
   
   output$combo_tbl_incomes <- renderDT({
     req(length(input$combo_users) > 0, length(input$combo_months) > 0)
-    inc <- tryCatch(incomes_react(), error = function(e) tibble()) %>%
+    inc <- db_read_incomes() %>%
       filter(username %in% input$combo_users, month %in% input$combo_months) %>%
       arrange(username, desc(created_at))
-    
     dt <- datatable(inc, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
     if ("income_amount" %in% names(inc)) {
       dt <- DT::formatCurrency(dt, "income_amount", currency = "₹", interval = 3, mark = ",", digits = 2)
@@ -490,10 +556,9 @@ server <- function(input, output, session) {
   
   output$combo_tbl_expenses <- renderDT({
     req(length(input$combo_users) > 0, length(input$combo_months) > 0)
-    exp <- tryCatch(expenses_react(), error = function(e) tibble()) %>%
+    exp <- db_read_expenses() %>%
       filter(username %in% input$combo_users, month %in% input$combo_months) %>%
       arrange(username, desc(date), desc(created_at))
-    
     dt <- datatable(exp, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
     if ("expense_amount" %in% names(exp)) {
       dt <- DT::formatCurrency(dt, "expense_amount", currency = "₹", interval = 3, mark = ",", digits = 2)
@@ -501,28 +566,21 @@ server <- function(input, output, session) {
     dt
   })
   
-  # Combined balances (user × month) for selected users/months
+  # Downloads for combined view
   output$dl_combo_balances <- downloadHandler(
     filename = function() "combined_balances_filtered.csv",
     content = function(file) {
-      recompute_balances()
-      bal <- suppressMessages(readr::read_csv(BALANCE_CSV, show_col_types = FALSE))
-      if (!"username" %in% names(bal)) {
-        write_csv(tibble(note = "balances.csv missing username; please add multi-user support"), file); return()
-      }
       req(length(input$combo_users) > 0, length(input$combo_months) > 0)
-      out <- bal %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+      out <- db_balances(usernames = input$combo_users, months = input$combo_months)
       write_csv(out, file)
     }
   )
-  
-  # Combined ledger (detailed) for selected users & months
   output$dl_combo_ledger <- downloadHandler(
     filename = function() "combined_ledger_filtered.csv",
     content = function(file) {
       req(length(input$combo_users) > 0, length(input$combo_months) > 0)
-      inc <- read_incomes()  %>% filter(username %in% input$combo_users, month %in% input$combo_months)
-      exp <- read_expenses() %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+      inc <- db_read_incomes()  %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+      exp <- db_read_expenses() %>% filter(username %in% input$combo_users, month %in% input$combo_months)
       
       inc_ledger <- inc %>% transmute(
         type        = "Income",
@@ -547,7 +605,7 @@ server <- function(input, output, session) {
         created_at
       )
       
-      # Ensure consistent types before binding
+      # ensure consistent types
       char_cols <- c("type","username","date","month","category","description","created_at")
       num_cols  <- c("credit","debit")
       for (c in intersect(names(inc_ledger), char_cols)) inc_ledger[[c]] <- as.character(inc_ledger[[c]])
@@ -559,160 +617,93 @@ server <- function(input, output, session) {
       write_csv(out, file)
     }
   )
-
   
-  # Username hint (availability)
-  output$username_hint <- renderUI({
-    u <- trimws(input$username_input %||% "")
-    if (!nzchar(u)) return(NULL)
-    usr <- read_users()
-    exists <- nrow(usr %>% filter(tolower(username) == tolower(u))) > 0
-    if (exists) {
-      span(style="color:#16a085;", "✅ Existing user; your data will be loaded.")
-    } else {
-      span(style="color:#2980b9;", "ℹ️ New user; your profile will be created.")
-    }
-  })
-  
-  # Little helper
-  `%||%` <- function(a, b) if (!is.null(a)) a else b
-  
-  # Handle sign-in
-  observeEvent(input$btn_signin, {
-    u_raw <- input$username_input %||% ""
-    u <- trimws(u_raw)
-    validate(need(nzchar(u), "Please enter a username."))
-    # Normalize storing as typed (keep case), but lookup case-insensitive
-    users <- read_users()
-    exists <- nrow(users %>% filter(tolower(username) == tolower(u))) > 0
-    
-    if (!exists) {
-      # create user
-      new_user <- tibble(
-        username = u,
-        created_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-      )
-      append_rows_and_save(new_user, USERS_CSV)
-    }
-    
-    current_user(u)
-    removeModal()
-    # Ensure balances reflect any legacy rows + this user
-    recompute_balances()
-  })
-  
-  # Allow switching user later
-  observeEvent(input$switch_user, {
-    open_signin_modal(preset = current_user() %||% "")
-  })
-  
-  # Who am I banner
-  output$whoami <- renderText({
-    cu <- current_user()
-    if (is.null(cu)) "—" else cu
-  })
-  
-  # Live readers (auto-refresh files every 2 seconds)
-  incomes_react  <- reactiveFileReader(2000, session, INCOME_CSV, function(f) read_incomes(f))
-  expenses_react <- reactiveFileReader(2000, session, EXPENSE_CSV, function(f) read_expenses(f))
-  balances_react <- reactiveFileReader(2000, session, BALANCE_CSV, function(file) {
-    if (!file.exists(file) || file.size(file) == 0) return(tibble())
-    df <- suppressMessages(readr::read_csv(file, show_col_types = FALSE))
-    if (!"username" %in% names(df)) {
-      recompute_balances()
-      df <- suppressMessages(readr::read_csv(file, show_col_types = FALSE))
-    }
-    df
-  })
-  
-  # Month picker options for CURRENT USER ONLY
+  # ------------- Personal Dashboard (current user) --------------
+  # Month picker options for current user
   output$month_picker <- renderUI({
     req(!is.null(current_user()))
     uid <- current_user()
-    inc <- tryCatch(incomes_react(),  error = function(e) tibble())
-    exp <- tryCatch(expenses_react(), error = function(e) tibble())
-    months <- c(inc$month[inc$username == uid], exp$month[exp$username == uid]) %>%
-      unique() %>% sort()
+    months <- db_user_months(uid)
     if (length(months) == 0) months <- to_month_key(Sys.Date())
     selectInput("selected_month", "Select month (YYYY-MM)", choices = months, selected = tail(months, 1))
   })
   
-  # Add Income (saves with username)
+  # Add Income
   observeEvent(input$btn_add_income, {
     req(!is.null(current_user()))
     req(!is.na(input$income_amount), input$income_amount >= 0)
     mkey <- to_month_key(input$income_month)
-    new_row <- tibble(
-      id            = new_id(),
-      username      = current_user(),
-      month         = mkey,
-      income_amount = as.numeric(input$income_amount),
-      source        = ifelse(nchar(trimws(input$income_source)) == 0, NA_character_, trimws(input$income_source)),
-      created_at    = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    db_insert_income(
+      id       = new_id(),
+      username = current_user(),
+      month    = mkey,
+      amount   = as.numeric(input$income_amount),
+      source   = ifelse(nchar(trimws(input$income_source)) == 0, NA_character_, trimws(input$income_source))
     )
-    append_rows_and_save(new_row, INCOME_CSV)
-    recompute_balances()
     showNotification(paste0("Income saved for ", mkey, " (", fmt_cur(input$income_amount), ")."), type = "message")
     updateNumericInput(session, "income_amount", value = NA_real_)
   })
   
-  # Add Expense (saves with username)
+  # Add Expense
   observeEvent(input$btn_add_expense, {
     req(!is.null(current_user()))
     req(!is.na(input$expense_amount), input$expense_amount >= 0, !is.null(input$expense_date))
     mkey <- to_month_key(input$expense_date)
-    new_row <- tibble(
-      id             = new_id(),
-      username       = current_user(),
-      date           = format(as.Date(input$expense_date), "%Y-%m-%d"),
-      month          = mkey,
-      category       = input$expense_category,
-      description    = ifelse(nchar(trimws(input$expense_desc)) == 0, NA_character_, trimws(input$expense_desc)),
-      expense_amount = as.numeric(input$expense_amount),
-      created_at     = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    db_insert_expense(
+      id          = new_id(),
+      username    = current_user(),
+      date        = as.Date(input$expense_date),
+      month       = mkey,
+      category    = input$expense_category,
+      description = ifelse(nchar(trimws(input$expense_desc)) == 0, NA_character_, trimws(input$expense_desc)),
+      amount      = as.numeric(input$expense_amount)
     )
-    append_rows_and_save(new_row, EXPENSE_CSV)
-    recompute_balances()
     showNotification(paste0("Expense saved for ", mkey, " (", fmt_cur(input$expense_amount), ")."), type = "message")
     updateNumericInput(session, "expense_amount", value = NA_real_)
   })
   
-  # Cards (selected month, current user)
+  # Cards (selected month)
   output$card_income <- renderText({
-    req(!is.null(current_user()))
-    sel <- req(input$selected_month)
-    uid <- current_user()
-    bal <- tryCatch(balances_react(), error = function(e) tibble())
-    val <- bal %>% filter(username == uid, month == sel) %>% pull(income_total)
-    if (length(val) == 0) val <- 0
-    fmt_cur(val)
+    req(!is.null(current_user()), input$selected_month)
+    i_tbl <- qt("incomes")
+    val <- DBI::dbGetQuery(
+      pool,
+      sprintf("SELECT COALESCE(SUM(income_amount), 0) AS total FROM %s WHERE username = ? AND month = ?", i_tbl),
+      params = list(current_user(), input$selected_month)
+    )$total
+    fmt_cur(val %||% 0)
   })
   
   output$card_expense <- renderText({
-    req(!is.null(current_user()))
-    sel <- req(input$selected_month)
-    uid <- current_user()
-    bal <- tryCatch(balances_react(), error = function(e) tibble())
-    val <- bal %>% filter(username == uid, month == sel) %>% pull(expense_total)
-    if (length(val) == 0) val <- 0
-    fmt_cur(val)
+    req(!is.null(current_user()), input$selected_month)
+    e_tbl <- qt("expenses")
+    val <- DBI::dbGetQuery(
+      pool,
+      sprintf("SELECT COALESCE(SUM(expense_amount), 0) AS total FROM %s WHERE username = ? AND month = ?", e_tbl),
+      params = list(current_user(), input$selected_month)
+    )$total
+    fmt_cur(val %||% 0)
   })
   
   output$card_balance <- renderText({
-    req(!is.null(current_user()))
-    sel <- req(input$selected_month)
-    uid <- current_user()
-    bal <- tryCatch(balances_react(), error = function(e) tibble())
-    val <- bal %>% filter(username == uid, month == sel) %>% pull(balance)
-    if (length(val) == 0) val <- 0
-    fmt_cur(val)
+    req(!is.null(current_user()), input$selected_month)
+    i_tbl <- qt("incomes"); e_tbl <- qt("expenses")
+    res <- DBI::dbGetQuery(
+      pool,
+      sprintf("
+      SELECT
+        (SELECT COALESCE(SUM(income_amount), 0) FROM %s WHERE username = ? AND month = ?) -
+        (SELECT COALESCE(SUM(expense_amount),0) FROM %s WHERE username = ? AND month = ?) AS bal
+    ", i_tbl, e_tbl),
+      params = list(current_user(), input$selected_month, current_user(), input$selected_month)
+    )$bal
+    fmt_cur(res %||% 0)
   })
   
-  # Monthly trend (current user)
+  # Trend (current user) – monthly series
   output$plot_trend <- renderPlot({
     req(!is.null(current_user()))
-    uid <- current_user()
-    bal <- tryCatch(balances_react(), error = function(e) tibble()) %>% filter(username == uid)
+    bal <- db_balances(usernames = current_user())
     req(nrow(bal) > 0)
     bal2 <- bal %>%
       mutate(month_date = ymd(paste0(month, "-01"))) %>%
@@ -731,31 +722,30 @@ server <- function(input, output, session) {
   
   # Tables (selected month, current user)
   output$tbl_incomes <- renderDT({
-    req(!is.null(current_user()))
-    sel <- req(input$selected_month)
-    uid <- current_user()
-    inc <- tryCatch(incomes_react(), error = function(e) tibble()) %>%
-      filter(username == uid, month == sel) %>%
-      arrange(desc(created_at))
-    datatable(inc, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
+    req(!is.null(current_user()), input$selected_month)
+    inc <- db_read_incomes(username = current_user(), month = input$selected_month)
+    dt <- datatable(inc, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
+    if ("income_amount" %in% names(inc)) {
+      dt <- DT::formatCurrency(dt, "income_amount", currency = "₹", interval = 3, mark = ",", digits = 2)
+    }
+    dt
   })
-  
   output$tbl_expenses <- renderDT({
-    req(!is.null(current_user()))
-    sel <- req(input$selected_month)
-    uid <- current_user()
-    exp <- tryCatch(expenses_react(), error = function(e) tibble()) %>%
-      filter(username == uid, month == sel) %>%
-      arrange(desc(date), desc(created_at))
-    datatable(exp, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
+    req(!is.null(current_user()), input$selected_month)
+    exp <- db_read_expenses(username = current_user(), month = input$selected_month)
+    dt <- datatable(exp, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
+    if ("expense_amount" %in% names(exp)) {
+      dt <- DT::formatCurrency(dt, "expense_amount", currency = "₹", interval = 3, mark = ",", digits = 2)
+    }
+    dt
   })
   
-  # Downloads (current user only)
+  # Downloads (current user)
   output$dl_incomes <- downloadHandler(
     filename = function() "incomes.csv",
     content = function(file) {
       uid <- current_user(); req(!is.null(uid))
-      inc <- read_incomes() %>% filter(username == uid)
+      inc <- db_read_incomes(username = uid)
       write_csv(inc, file)
     }
   )
@@ -763,27 +753,24 @@ server <- function(input, output, session) {
     filename = function() "expenses.csv",
     content = function(file) {
       uid <- current_user(); req(!is.null(uid))
-      exp <- read_expenses() %>% filter(username == uid)
+      exp <- db_read_expenses(username = uid)
       write_csv(exp, file)
     }
   )
   output$dl_balances <- downloadHandler(
     filename = function() "balances.csv",
     content = function(file) {
-      recompute_balances()
       uid <- current_user(); req(!is.null(uid))
-      bal <- suppressMessages(read_csv(BALANCE_CSV, show_col_types = FALSE)) %>% filter(username == uid)
+      bal <- db_balances(usernames = uid)
       write_csv(bal, file)
     }
   )
-  
-  # Combined ledger for export (current user only)
   output$dl_ledger <- downloadHandler(
     filename = function() "combined_ledger.csv",
     content = function(file) {
       uid <- current_user(); req(!is.null(uid))
-      inc <- read_incomes()  %>% filter(username == uid)
-      exp <- read_expenses() %>% filter(username == uid)
+      inc <- db_read_incomes(username = uid)
+      exp <- db_read_expenses(username = uid)
       
       inc_ledger <- inc %>%
         transmute(
@@ -796,33 +783,18 @@ server <- function(input, output, session) {
           debit       = NA_real_,
           created_at
         )
-      
       exp_ledger <- exp %>%
         transmute(
-          type,        # not present; set explicitly below to avoid bind issues
+          type        = "Expense",
           date,
           month,
           category,
           description,
-          credit,
-          debit,
-          created_at
-        )
-      
-      # Build expense ledger cleanly with types aligned
-      exp_ledger <- exp %>%
-        transmute(
-          type        = "Expense",
-          date        = date,
-          month       = month,
-          category    = category,
-          description = description,
           credit      = NA_real_,
           debit       = expense_amount,
-          created_at  = created_at
+          created_at
         )
-      
-      # Enforce column types before bind
+      # align & bind
       char_cols <- c("type","date","month","category","description","created_at")
       num_cols  <- c("credit","debit")
       for (c in intersect(names(inc_ledger), char_cols)) inc_ledger[[c]] <- as.character(inc_ledger[[c]])
@@ -834,11 +806,6 @@ server <- function(input, output, session) {
       write_csv(ledger, file)
     }
   )
-  
-  # Initial recompute to ensure balances.csv is consistent
-  observe({
-    recompute_balances()
-  })
 }
 
 # ───────────────────────────────────────────────────────────────
