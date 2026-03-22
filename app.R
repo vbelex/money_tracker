@@ -205,6 +205,41 @@ ui <- navbarPage(
   theme = shinytheme("flatly"),
   
   tabPanel(
+    "Combined Dashboard",
+    sidebarLayout(
+      sidebarPanel(
+        width = 3,
+        h4("Select Scope"),
+        uiOutput("combo_user_selector"),
+        uiOutput("combo_month_selector"),
+        hr(),
+        downloadButton("dl_combo_balances", "Download combined balances.csv"),
+        br(), br(),
+        downloadButton("dl_combo_ledger", "Download combined_ledger.csv")
+      ),
+      mainPanel(
+        fluidRow(
+          column(4, wellPanel(h4("Total Income"),  h2(textOutput("combo_card_income")))),
+          column(4, wellPanel(h4("Total Expenses"), h2(textOutput("combo_card_expense")))),
+          column(4, wellPanel(h4("Total Balance"),  h2(textOutput("combo_card_balance"))))
+        ),
+        hr(),
+        h4("Trend (Selected Users)"),
+        plotOutput("combo_plot_trend", height = 300),
+        hr(),
+        h4("Breakdown by User (Selected Months)"),
+        DTOutput("combo_tbl_by_user"),
+        hr(),
+        h4("Detailed Incomes"),
+        DTOutput("combo_tbl_incomes"),
+        hr(),
+        h4("Detailed Expenses"),
+        DTOutput("combo_tbl_expenses")
+      )
+    )
+  ),
+  
+  tabPanel(
     "Dashboard",
     sidebarLayout(
       sidebarPanel(
@@ -330,6 +365,201 @@ server <- function(input, output, session) {
   
   # Show modal on app start
   open_signin_modal()
+  
+  # Select users available in registry (or with data)
+  output$combo_user_selector <- renderUI({
+    # If you are using read_users(); else build from incomes/expenses
+    users <- tryCatch(read_users(), error = function(e) tibble())
+    # Fall back to usernames in data if users.csv is empty
+    inc <- tryCatch(incomes_react(), error = function(e) tibble())
+    exp <- tryCatch(expenses_react(), error = function(e) tibble())
+    data_users <- unique(c(inc$username %||% character(), exp$username %||% character()))
+    choices <- sort(unique(c(users$username %||% character(), data_users)))
+    selectizeInput(
+      "combo_users",
+      "Users",
+      choices = choices,
+      multiple = TRUE,
+      options = list(placeholder = "Choose one or more users")
+    )
+  })
+  
+  # Select months available for selected users
+  output$combo_month_selector <- renderUI({
+    req(length(input$combo_users) > 0)
+    inc <- tryCatch(incomes_react(), error = function(e) tibble())
+    exp <- tryCatch(expenses_react(), error = function(e) tibble())
+    months <- c(
+      inc$month[inc$username %in% input$combo_users],
+      exp$month[exp$username %in% input$combo_users]
+    ) %>% unique() %>% sort()
+    if (length(months) == 0) months <- to_month_key(Sys.Date())
+    selectizeInput(
+      "combo_months",
+      "Months (YYYY-MM)",
+      choices = months,
+      selected = tail(months, min(6, length(months))),  # preselect last few
+      multiple = TRUE
+    )
+  })
+  
+  # Helper to slice balances for selected users & months
+  combo_balances_selected <- reactive({
+    req(length(input$combo_users) > 0, length(input$combo_months) > 0)
+    bal <- tryCatch(balances_react(), error = function(e) tibble())
+    if (!"username" %in% names(bal)) return(tibble())  # in case legacy
+    bal %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+  })
+  
+  output$combo_card_income <- renderText({
+    bal <- combo_balances_selected()
+    val <- sum(bal$income_total %||% 0, na.rm = TRUE)
+    fmt_cur(val)
+  })
+  
+  output$combo_card_expense <- renderText({
+    bal <- combo_balances_selected()
+    val <- sum(bal$expense_total %||% 0, na.rm = TRUE)
+    fmt_cur(val)
+  })
+  
+  output$combo_card_balance <- renderText({
+    bal <- combo_balances_selected()
+    val <- sum((bal$income_total %||% 0) - (bal$expense_total %||% 0), na.rm = TRUE)
+    fmt_cur(val)
+  })
+  
+  output$combo_plot_trend <- renderPlot({
+    bal <- combo_balances_selected()
+    req(nrow(bal) > 0)
+    bal2 <- bal %>%
+      group_by(month) %>%
+      summarise(
+        income_total = sum(income_total, na.rm = TRUE),
+        expense_total = sum(expense_total, na.rm = TRUE),
+        balance = income_total - expense_total,
+        .groups = "drop"
+      ) %>%
+      mutate(month_date = lubridate::ymd(paste0(month, "-01"))) %>%
+      arrange(month_date)
+    
+    ggplot(bal2, aes(x = month_date)) +
+      geom_col(aes(y = income_total, fill = "Income"), width = 25, alpha = 0.7) +
+      geom_col(aes(y = -expense_total, fill = "Expenses"), width = 25, alpha = 0.7) +
+      geom_line(aes(y = balance, color = "Balance"), linewidth = 1.1) +
+      geom_point(aes(y = balance, color = "Balance"), size = 2) +
+      scale_fill_manual(values = c("Income" = "#2ecc71", "Expenses" = "#e74c3c")) +
+      scale_color_manual(values = c("Balance" = "#3498db")) +
+      # non-scientific labels with ₹
+      scale_y_continuous(labels = scales::label_comma(accuracy = 1, prefix = "₹")) +
+      labs(x = "Month", y = "Amount", fill = "", color = "", title = "Combined Income / Expenses / Balance") +
+      theme_minimal()
+  })
+  
+  output$combo_tbl_by_user <- renderDT({
+    bal <- combo_balances_selected()
+    req(nrow(bal) > 0)
+    by_user <- bal %>%
+      group_by(username) %>%
+      summarise(
+        income_total  = sum(income_total,  na.rm = TRUE),
+        expense_total = sum(expense_total, na.rm = TRUE),
+        balance       = income_total - expense_total,
+        .groups = "drop"
+      ) %>% arrange(desc(balance))
+    
+    dt <- datatable(by_user, rownames = FALSE, options = list(pageLength = 10, autoWidth = TRUE))
+    dt <- DT::formatCurrency(dt, "income_total",  currency = "₹", interval = 3, mark = ",", digits = 2)
+    dt <- DT::formatCurrency(dt, "expense_total", currency = "₹", interval = 3, mark = ",", digits = 2)
+    dt <- DT::formatCurrency(dt, "balance",      currency = "₹", interval = 3, mark = ",", digits = 2)
+    dt
+  })
+  
+  output$combo_tbl_incomes <- renderDT({
+    req(length(input$combo_users) > 0, length(input$combo_months) > 0)
+    inc <- tryCatch(incomes_react(), error = function(e) tibble()) %>%
+      filter(username %in% input$combo_users, month %in% input$combo_months) %>%
+      arrange(username, desc(created_at))
+    
+    dt <- datatable(inc, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
+    if ("income_amount" %in% names(inc)) {
+      dt <- DT::formatCurrency(dt, "income_amount", currency = "₹", interval = 3, mark = ",", digits = 2)
+    }
+    dt
+  })
+  
+  output$combo_tbl_expenses <- renderDT({
+    req(length(input$combo_users) > 0, length(input$combo_months) > 0)
+    exp <- tryCatch(expenses_react(), error = function(e) tibble()) %>%
+      filter(username %in% input$combo_users, month %in% input$combo_months) %>%
+      arrange(username, desc(date), desc(created_at))
+    
+    dt <- datatable(exp, rownames = FALSE, options = list(pageLength = 5, autoWidth = TRUE))
+    if ("expense_amount" %in% names(exp)) {
+      dt <- DT::formatCurrency(dt, "expense_amount", currency = "₹", interval = 3, mark = ",", digits = 2)
+    }
+    dt
+  })
+  
+  # Combined balances (user × month) for selected users/months
+  output$dl_combo_balances <- downloadHandler(
+    filename = function() "combined_balances_filtered.csv",
+    content = function(file) {
+      recompute_balances()
+      bal <- suppressMessages(readr::read_csv(BALANCE_CSV, show_col_types = FALSE))
+      if (!"username" %in% names(bal)) {
+        write_csv(tibble(note = "balances.csv missing username; please add multi-user support"), file); return()
+      }
+      req(length(input$combo_users) > 0, length(input$combo_months) > 0)
+      out <- bal %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+      write_csv(out, file)
+    }
+  )
+  
+  # Combined ledger (detailed) for selected users & months
+  output$dl_combo_ledger <- downloadHandler(
+    filename = function() "combined_ledger_filtered.csv",
+    content = function(file) {
+      req(length(input$combo_users) > 0, length(input$combo_months) > 0)
+      inc <- read_incomes()  %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+      exp <- read_expenses() %>% filter(username %in% input$combo_users, month %in% input$combo_months)
+      
+      inc_ledger <- inc %>% transmute(
+        type        = "Income",
+        username,
+        date        = paste0(month, "-01"),
+        month,
+        category    = source,
+        description = NA_character_,
+        credit      = income_amount,
+        debit       = NA_real_,
+        created_at
+      )
+      exp_ledger <- exp %>% transmute(
+        type        = "Expense",
+        username,
+        date,
+        month,
+        category,
+        description,
+        credit      = NA_real_,
+        debit       = expense_amount,
+        created_at
+      )
+      
+      # Ensure consistent types before binding
+      char_cols <- c("type","username","date","month","category","description","created_at")
+      num_cols  <- c("credit","debit")
+      for (c in intersect(names(inc_ledger), char_cols)) inc_ledger[[c]] <- as.character(inc_ledger[[c]])
+      for (c in intersect(names(exp_ledger), char_cols)) exp_ledger[[c]] <- as.character(exp_ledger[[c]])
+      for (c in intersect(names(inc_ledger), num_cols))  inc_ledger[[c]] <- suppressWarnings(as.numeric(inc_ledger[[c]]))
+      for (c in intersect(names(exp_ledger), num_cols))  exp_ledger[[c]] <- suppressWarnings(as.numeric(exp_ledger[[c]]))
+      
+      out <- bind_rows(inc_ledger, exp_ledger) %>% arrange(username, date, desc(type))
+      write_csv(out, file)
+    }
+  )
+
   
   # Username hint (availability)
   output$username_hint <- renderUI({
