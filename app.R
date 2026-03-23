@@ -24,17 +24,38 @@ options(scipen = 999)  # bias against scientific notation
 # ───────────────────────────────────────────────────────────────
 # DB Connection Pool (Azure SQL via ODBC Driver 18)
 # ───────────────────────────────────────────────────────────────
-pool <- pool::dbPool(
-  drv      = odbc::odbc(),
-  Driver   = "ODBC Driver 18 for SQL Server",
-  Server   = Sys.getenv("SERVER"),
-  Database = Sys.getenv("DATABASE"),
-  UID      = Sys.getenv("AZURE_SQL_UID"),
-  PWD      = Sys.getenv("AZURE_SQL_PWD"),  # set in .Renviron or hosting secret
-  Encrypt  = "yes",
-  TrustServerCertificate = "no",
-  Timeout  = 30
-)
+if (Sys.getenv("R_CONFIG_ACTIVE") == "connect_cloud") {
+  pool <- pool::dbPool(
+    drv = odbc::odbc(),
+    .connection_string = paste0(
+      "Driver=FreeTDS;",
+      "TDS_Version=7.2;",
+      "Server=", Sys.getenv("SERVER"), ";",
+      "Port=1433;",
+      "Database=", Sys.getenv("SERVER"), ";",
+      "Uid=", Sys.getenv("AZURE_SQL_UID"), ";",
+      "Pwd=", Sys.getenv("AZURE_SQL_PWD"), ";",
+      "Encrypt=yes;",
+      "TrustServerCertificate=no;",
+      "Connection Timeout=30;"
+    )
+  )
+} else {
+  pool <- pool::dbPool(
+    drv      = odbc::odbc(),
+    Driver   = "ODBC Driver 18 for SQL Server",
+    Server   = Sys.getenv("SERVER"),
+    Database = Sys.getenv("DATABASE"),
+    UID      = Sys.getenv("AZURE_SQL_UID"),
+    PWD      = Sys.getenv("AZURE_SQL_PWD"),  # set in .Renviron or hosting secret
+    Encrypt  = "yes",
+    TrustServerCertificate = "no",
+    Timeout  = 30
+  )
+  
+}
+
+
 
 onStop(function() {
   pool::poolClose(pool)
