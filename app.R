@@ -30,7 +30,7 @@ DB_PORT <- 1433
 DB_NAME <- Sys.getenv("DATABASE")                 # database name
 DB_USER <- Sys.getenv("AZURE_SQL_UID")
 DB_PWD  <- Sys.getenv("AZURE_SQL_PWD")  
-
+DB_SCHEMA <- Sys.getenv("SCHEMA_NAME")
 
 if (Sys.getenv("R_CONFIG_ACTIVE") == "connect_cloud") {
   pool <- tryCatch({
@@ -69,6 +69,11 @@ if (Sys.getenv("R_CONFIG_ACTIVE") == "connect_cloud") {
 }
 
 
+db_ok <- !is.null(pool) && tryCatch({
+  DBI::dbGetQuery(pool, "SELECT 1 AS ok")
+  TRUE
+}, error = function(e) FALSE)
+
 
 onStop(function() {
   pool::poolClose(pool)
@@ -81,11 +86,32 @@ onStop(function() {
 # Helpers
 # ───────────────────────────────────────────────────────────────
 
-DB_SCHEMA <- Sys.getenv("SCHEMA_NAME")
-
 # Quote [schema].[table] safely for SQL Server via DBI
+# Safe schema/table quoting helper
 qt <- function(tbl) {
-  DBI::dbQuoteIdentifier(pool, DBI::Id(schema = DB_SCHEMA, table = tbl)) |> as.character()
+  
+  # --- 1. If pool does not exist ---
+  if (!exists("pool", inherits = TRUE) || is.null(pool)) {
+    # fallback to literal [schema].[table]
+    return(paste0("[", DB_SCHEMA, "].[", tbl, "]"))
+  }
+  
+  # --- 2. If pool exists but is not valid ---
+  valid <- FALSE
+  try(valid <- DBI::dbIsValid(pool), silent = TRUE)
+  
+  if (!valid) {
+    # return fallback quoting, avoid calling dbQuoteIdentifier
+    return(paste0("[", DB_SCHEMA, "].[", tbl, "]"))
+  }
+  
+  # --- 3. Safe path: pool is valid ---
+  as.character(
+    DBI::dbQuoteIdentifier(
+      pool,
+      DBI::Id(schema = DB_SCHEMA, table = tbl)
+    )
+  )
 }
 
 # tiny paste helper used below
@@ -407,7 +433,7 @@ server <- function(input, output, session) {
       title = "Sign in",
       tagList(
         p("Enter your username. If it doesn't exist, we'll create it."),
-        textInput("username_input", "Username", value = preset, placeholder = "e.g., vaibhav"),
+        textInput("username_input", "Username", value = preset, placeholder = "e.g., john"),
         uiOutput("username_hint")
       ),
       footer = tagList(
