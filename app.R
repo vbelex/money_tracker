@@ -122,7 +122,7 @@ ui <- navbarPage(
           dateInput("expense_date", "Expense date", value = Sys.Date(), format = "yyyy-mm-dd"),
           selectInput(
             "expense_category", "Category",
-            choices = c("Groceries", "Rent", "Utilities", "Transport", "Dining", "Health", "Education", "Shopping", "Entertainment", "EMI", "Credit Card Bill", "Other"),
+            choices = c("Groceries", "Rent", "Utilities", "Transport", "Dining", "Health", "Education", "Shopping", "Entertainment", "EMI", "Credit Card Bill", "Other", "Savings"),
             selected = "Groceries"
           ),
           textInput("expense_desc", "Description (optional)", placeholder = "Note or merchant"),
